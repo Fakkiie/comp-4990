@@ -8,6 +8,10 @@ interface SessionRecord {
 }
 
 export class EvContract extends Contract {
+  constructor() {
+    super("ev-contract");
+  }
+
   async WriteSession(
     ctx: Context,
     sessionId: string,
@@ -20,8 +24,6 @@ export class EvContract extends Contract {
     console.log("payload:", payload);
 
     const existing = await ctx.stub.getState(sessionId);
-    console.log("existing length:", existing ? existing.length : 0);
-
     if (existing && existing.length > 0) {
       throw new Error(`Session ${sessionId} already exists`);
     }
@@ -43,20 +45,14 @@ export class EvContract extends Contract {
       Buffer.from(JSON.stringify(record), "utf8")
     );
 
-    console.log("==== WriteSession DONE putState ====");
+    console.log("==== WriteSession DONE ====");
   }
 
   async ReadSession(ctx: Context, sessionId: string): Promise<string> {
-    console.log("==== ReadSession CALLED ====");
-    console.log("sessionId:", sessionId);
-
     const data = await ctx.stub.getState(sessionId);
-    console.log("getState length:", data ? data.length : 0);
-
     if (!data || data.length === 0) {
       throw new Error(`Session ${sessionId} does not exist`);
     }
-
     return data.toString();
   }
 }
