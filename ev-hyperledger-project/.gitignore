@@ -1,2 +1,4 @@
 node_modules/
 dist/
+ev-hyperledger-project/ledger-server/.env
+.env
