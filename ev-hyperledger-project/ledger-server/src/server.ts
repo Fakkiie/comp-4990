@@ -1,17 +1,45 @@
+import "dotenv/config";
 import path from "path";
 import fs from "fs";
 import express, { Request, Response } from "express";
 import cors from "cors";
 import { Gateway, Wallets } from "fabric-network";
 
+import { healthRouter } from "./routes/health.routes";
+import { createSessionsRouter } from "./routes/session.routes";
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 let contract: any = null;
+
+/** ---------------- SSE ---------------- */
 const sseClients = new Set<Response>();
 
-//load wallet identity
+function broadcastSSE(data: any) {
+  const msg = `data: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(msg);
+    } catch {
+      // ignore; close handler will clean up
+    }
+  }
+}
+
+/** contract ref wrapper so routes can fetch latest contract after init */
+const contractRef = {
+  get: () => contract,
+};
+
+/** ---------------- Routes ---------------- */
+app.use("/health", healthRouter);
+
+// ✅ IMPORTANT: pass broadcaster so session routes push to UI live
+app.use("/api/sessions", createSessionsRouter(contractRef, broadcastSSE));
+
+/** ---------------- Fabric Identity ---------------- */
 async function loadIdentity() {
   const walletPath = path.join(__dirname, "wallet");
   const wallet = await Wallets.newFileSystemWallet(walletPath);
@@ -23,9 +51,7 @@ async function loadIdentity() {
     return { wallet, identityLabel };
   }
 
-  console.log(
-    `Identity "${identityLabel}" not found — importing Admin@org1...`
-  );
+  console.log(`Identity "${identityLabel}" not found — importing Admin@org1...`);
 
   const mspPath = path.resolve(
     process.env.HOME || "",
@@ -53,23 +79,18 @@ async function loadIdentity() {
   const certificate = fs.readFileSync(certPath, "utf8");
   const privateKey = fs.readFileSync(keyPath, "utf8");
 
-//identity format
   const identity: any = {
-    credentials: {
-      certificate,
-      privateKey,
-    },
+    credentials: { certificate, privateKey },
     mspId: "Org1MSP",
     type: "X.509",
   };
 
   await wallet.put(identityLabel, identity);
-
   console.log(`Imported Admin@org1 as "${identityLabel}".`);
   return { wallet, identityLabel };
 }
 
-//init fab maybe remove this 
+/** ---------------- Fabric Init ---------------- */
 async function initFabric() {
   const ccpPath = path.resolve(
     process.env.HOME || "",
@@ -80,8 +101,8 @@ async function initFabric() {
     "org1.example.com",
     "connection-org1.json"
   );
-  const ccp = JSON.parse(fs.readFileSync(ccpPath, "utf8"));
 
+  const ccp = JSON.parse(fs.readFileSync(ccpPath, "utf8"));
   const { wallet, identityLabel } = await loadIdentity();
 
   const gateway = new Gateway();
@@ -94,29 +115,29 @@ async function initFabric() {
   const network = await gateway.getNetwork("mychannel");
   contract = network.getContract("ev-contract");
 
-  console.log("Fabric connection ready (discovery ON, event service OFF).");
+  console.log("Fabric connection ready (discovery ON).");
 }
 
-//writes event to chain and sse
+/** ---------------- /api/log (kept) ---------------- */
 app.post("/api/log", async (req: Request, res: Response) => {
   try {
     if (!contract) {
-      return res.status(500).json({ error: "Fabric not initialized" });
+      return res
+        .status(503)
+        .json({ error: "Fabric not initialized (still ok for DB endpoints)" });
     }
 
     const { sessionId, source, payload } = req.body;
 
     if (!sessionId || !source || !payload) {
-      return res.status(400).json({
-        error: "sessionId, source, and payload are required",
-      });
+      return res
+        .status(400)
+        .json({ error: "sessionId, source, and payload are required" });
     }
 
-    //create transaction to get tx id
     const tx = contract.createTransaction("WriteSession");
 
     let txId: string;
-
     if (typeof tx.getTransactionId === "function") {
       const raw = tx.getTransactionId();
       txId =
@@ -125,12 +146,8 @@ app.post("/api/log", async (req: Request, res: Response) => {
       txId = "UNKNOWN_TX";
     }
 
-    console.log("Resolved TX ID:", txId);
-
-    //submit chaincode call
     await tx.submit(sessionId, source, payload);
 
-    //build record for SSE
     const record = {
       sessionId,
       source,
@@ -139,16 +156,8 @@ app.post("/api/log", async (req: Request, res: Response) => {
       txId,
     };
 
-    //broadcast to SSE clients
-    for (const client of sseClients) {
-      client.write(
-        `data: ${JSON.stringify({
-          eventName: "WriteSession",
-          txId,
-          payload: record,
-        })}\n\n`
-      );
-    }
+    // ✅ broadcast so UI sees it
+    broadcastSSE({ eventName: "WriteSession", txId, payload: record });
 
     return res.json({ ok: true, txId });
   } catch (err: any) {
@@ -157,32 +166,54 @@ app.post("/api/log", async (req: Request, res: Response) => {
   }
 });
 
-//sse endpoint to get events
+/** ---------------- SSE endpoint (reliable: flush + heartbeat) ---------------- */
 app.get("/events", (req: Request, res: Response) => {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-  res.write("\n");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+
+  // @ts-ignore
+  res.flushHeaders?.();
+
+  // immediate hello event so UI can confirm connection
+  res.write(
+    `data: ${JSON.stringify({
+      eventName: "SSE_CONNECTED",
+      ts: new Date().toISOString(),
+    })}\n\n`
+  );
 
   sseClients.add(res);
   console.log("SSE client connected:", sseClients.size);
 
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(
+        `data: ${JSON.stringify({
+          eventName: "PING",
+          ts: new Date().toISOString(),
+        })}\n\n`
+      );
+    } catch {}
+  }, 15000);
+
   req.on("close", () => {
+    clearInterval(heartbeat);
     sseClients.delete(res);
     console.log("SSE client disconnected:", sseClients.size);
   });
 });
 
-//start server after fabric init
-initFabric()
-  .then(() => {
-    app.listen(4000, () => {
-      console.log("Ledger server listening on http://localhost:4000");
-    });
-  })
-  .catch((err) => {
-    console.error("Failed to init Fabric:", err);
-    process.exit(1);
-  });
+/** ---------------- Start server, then init Fabric ---------------- */
+app.listen(4000, () => {
+  console.log("Ledger server listening on http://localhost:4000");
+});
+
+initFabric().catch((err) => {
+  console.error(
+    "Fabric init failed (DB routes still available):",
+    err.message || err
+  );
+});

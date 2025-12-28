@@ -1,10 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
+/** ---------------- Types ---------------- */
 interface EventRecord {
   id?: string;
-  payload?: string; // JSON string with { message }
+  payload?: string; // raw payload string (your server sends record.payload as string)
   timestamp?: string;
   txId?: string;
+  sessionId?: string;
+  source?: string;
 }
 
 interface IncomingEvent {
@@ -13,14 +16,61 @@ interface IncomingEvent {
   payload: EventRecord;
 }
 
+type SessionStatus = "active" | "paused" | "ended" | "expired" | string;
+
+interface SessionResponse {
+  ok: boolean;
+  session?: {
+    evId: string;
+    sessionId: string;
+    powerRequired: number;
+    powerConsumed: number;
+    cost: number;
+    status: SessionStatus;
+    expiresAt: string;
+  };
+  resumeToken?: string;
+  txId?: string | null;
+  error?: string;
+}
+
+const API_BASE = "http://localhost:4000";
+
+function prettyJson(v: any) {
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
+
 function App() {
+  /** ---------------- Existing ledger/SSE state ---------------- */
   const [message, setMessage] = useState("");
   const [status, setStatus] = useState("");
   const [events, setEvents] = useState<IncomingEvent[]>([]);
   const [filter, setFilter] = useState("");
 
+  /** ---------------- New session/token tester state ---------------- */
+  const [dbHealth, setDbHealth] = useState<"unknown" | "ok" | "fail">(
+    "unknown"
+  );
+  const [dbHealthDetail, setDbHealthDetail] = useState<string>("");
+
+  const [evId, setEvId] = useState("EV123");
+  const [powerRequired, setPowerRequired] = useState<number>(18.5);
+
+  const [sessionId, setSessionId] = useState<string>("");
+  const [resumeToken, setResumeToken] = useState<string>("");
+
+  const [sessionStatus, setSessionStatus] = useState<SessionStatus>("—");
+  const [expiresAt, setExpiresAt] = useState<string>("—");
+
+  const [apiLog, setApiLog] = useState<string>("");
+
+  /** ---------------- SSE: subscribe to /events ---------------- */
   useEffect(() => {
-    const es = new EventSource("http://localhost:4000/events");
+    const es = new EventSource(`${API_BASE}/events`);
 
     es.onmessage = (e) => {
       try {
@@ -40,6 +90,32 @@ function App() {
     };
   }, []);
 
+  /** ---------------- DB health check ---------------- */
+  const runDbHealth = async () => {
+    setDbHealth("unknown");
+    setDbHealthDetail("");
+    try {
+      const res = await fetch(`${API_BASE}/health/db`);
+      const json = await res.json();
+      if (res.ok && json?.ok) {
+        setDbHealth("ok");
+        setDbHealthDetail(prettyJson(json));
+      } else {
+        setDbHealth("fail");
+        setDbHealthDetail(prettyJson(json));
+      }
+    } catch (e: any) {
+      setDbHealth("fail");
+      setDbHealthDetail(e?.message ?? String(e));
+    }
+  };
+
+  useEffect(() => {
+    runDbHealth();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** ---------------- Existing: send a raw Fabric log via /api/log ---------------- */
   const handleSend = async () => {
     const trimmed = message.trim();
     if (!trimmed) {
@@ -49,13 +125,13 @@ function App() {
 
     setStatus("Sending...");
     try {
-      const res = await fetch("http://localhost:4000/api/log", {
+      const res = await fetch(`${API_BASE}/api/log`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sessionId: crypto.randomUUID(), // auto-generate session ID
-          source: "ui", // mark events as coming from the UI
-          payload: trimmed, // raw message
+          sessionId: crypto.randomUUID(),
+          source: "ui",
+          payload: trimmed,
         }),
       });
 
@@ -73,20 +149,116 @@ function App() {
     }
   };
 
-  const filteredEvents = events.filter((evt) => {
-    if (!filter.trim()) return true;
-    const rec = evt.payload || {};
-    const txtPieces = [evt.txId, rec.txId, rec.id, rec.timestamp, rec.payload]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-    return txtPieces.includes(filter.toLowerCase());
-  });
+  /** ---------------- New: helper to call session endpoints ---------------- */
+  async function callSessionEndpoint<T = any>(
+    path: string,
+    body: Record<string, any>
+  ): Promise<T> {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = json?.error || `HTTP ${res.status}`;
+      throw new Error(msg);
+    }
+    return json as T;
+  }
+
+  const syncFromSessionResponse = (data: SessionResponse) => {
+    if (data?.session) {
+      setSessionId(data.session.sessionId);
+      setSessionStatus(data.session.status);
+      setExpiresAt(data.session.expiresAt);
+    }
+    if (typeof data?.resumeToken === "string" && data.resumeToken.length) {
+      setResumeToken(data.resumeToken);
+    }
+  };
+
+  /** ---------------- New: Start/Pause/Resume/Stop ---------------- */
+  const doStart = async () => {
+    setApiLog("Calling /api/sessions/start ...");
+    try {
+      const data = await callSessionEndpoint<SessionResponse>(
+        "/api/sessions/start",
+        { evId, powerRequired }
+      );
+      syncFromSessionResponse(data);
+      setApiLog(prettyJson(data));
+    } catch (e: any) {
+      setApiLog("ERROR: " + (e?.message ?? String(e)));
+    }
+  };
+
+  const doPause = async () => {
+    if (!sessionId) return alert("No sessionId yet. Start first.");
+    setApiLog("Calling /api/sessions/pause ...");
+    try {
+      const data = await callSessionEndpoint<SessionResponse>(
+        "/api/sessions/pause",
+        { evId, sessionId }
+      );
+      syncFromSessionResponse(data);
+      setApiLog(prettyJson(data));
+    } catch (e: any) {
+      setApiLog("ERROR: " + (e?.message ?? String(e)));
+    }
+  };
+
+  const doResume = async () => {
+    if (!sessionId) return alert("No sessionId yet. Start first.");
+    if (!resumeToken)
+      return alert("No resumeToken yet. Start (or paste token) first.");
+    setApiLog("Calling /api/sessions/resume ...");
+    try {
+      const data = await callSessionEndpoint<SessionResponse>(
+        "/api/sessions/resume",
+        { evId, sessionId, resumeToken }
+      );
+      // Resume rotates token (recommended), so we update it from response
+      syncFromSessionResponse(data);
+      setApiLog(prettyJson(data));
+    } catch (e: any) {
+      setApiLog("ERROR: " + (e?.message ?? String(e)));
+    }
+  };
+
+  const doStop = async () => {
+    if (!sessionId) return alert("No sessionId yet. Start first.");
+    setApiLog("Calling /api/sessions/stop ...");
+    try {
+      const data = await callSessionEndpoint<SessionResponse>(
+        "/api/sessions/stop",
+        { evId, sessionId }
+      );
+      syncFromSessionResponse(data);
+      setApiLog(prettyJson(data));
+    } catch (e: any) {
+      setApiLog("ERROR: " + (e?.message ?? String(e)));
+    }
+  };
+
+  /** ---------------- Filtered events table (existing) ---------------- */
+  const filteredEvents = useMemo(() => {
+    return events.filter((evt) => {
+      if (!filter.trim()) return true;
+      const rec = evt.payload || {};
+      const txtPieces = [evt.txId, rec.txId, rec.id, rec.timestamp, rec.payload]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return txtPieces.includes(filter.toLowerCase());
+    });
+  }, [events, filter]);
 
   const latestTs =
     events[0]?.payload?.timestamp ??
     (events.length ? "(from chain events)" : "—");
 
+  /** ---------------- UI ---------------- */
   return (
     <div className="min-h-screen bg-slate-950 text-slate-50">
       {/* Top bar */}
@@ -106,6 +278,7 @@ function App() {
               </p>
             </div>
           </div>
+
           <div className="hidden sm:flex items-center gap-3 text-xs text-slate-400">
             <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
             <span>Gateway: Org1 · Identity: appUser</span>
@@ -123,6 +296,7 @@ function App() {
               Count since this dashboard connected.
             </p>
           </div>
+
           <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
             <p className="text-xs font-medium text-slate-400">
               Last on-chain timestamp
@@ -131,9 +305,10 @@ function App() {
               {latestTs}
             </p>
             <p className="mt-1 text-xs text-slate-500">
-              Based on <code>LogEvent</code> payload.
+              Based on <code>WriteSession</code> payload.
             </p>
           </div>
+
           <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 flex flex-col justify-between">
             <div>
               <p className="text-xs font-medium text-slate-400">
@@ -144,22 +319,175 @@ function App() {
               </p>
             </div>
             <p className="mt-2 text-[0.7rem] text-slate-500">
-              Messages are submitted as Fabric transactions using the{" "}
-              <code>LogEvent</code> function.
+              SSE is listening on <code>/events</code>.
             </p>
           </div>
         </section>
 
-        {/* Input + filter */}
+        {/* NEW: Session / Token tester */}
+        <section className="rounded-xl border border-slate-800 bg-slate-900/80 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-200">
+                Session / Token Tester (Supabase)
+              </h2>
+              <p className="mt-1 text-xs text-slate-400">
+                Start → Pause/Resume → Stop. Resume rotates token each time.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 text-xs">
+              <button
+                onClick={runDbHealth}
+                className="rounded-full border border-slate-700 bg-slate-950/40 px-3 py-1.5 hover:bg-slate-900"
+              >
+                Re-check DB
+              </button>
+              <span
+                className={[
+                  "inline-flex items-center gap-2 rounded-full px-3 py-1.5 border text-xs",
+                  dbHealth === "ok"
+                    ? "border-emerald-700/60 bg-emerald-500/10 text-emerald-200"
+                    : dbHealth === "fail"
+                    ? "border-red-700/60 bg-red-500/10 text-red-200"
+                    : "border-slate-700 bg-slate-950/40 text-slate-300",
+                ].join(" ")}
+              >
+                <span
+                  className={[
+                    "h-2 w-2 rounded-full",
+                    dbHealth === "ok"
+                      ? "bg-emerald-400"
+                      : dbHealth === "fail"
+                      ? "bg-red-400"
+                      : "bg-slate-500",
+                  ].join(" ")}
+                />
+                DB: {dbHealth.toUpperCase()}
+              </span>
+            </div>
+          </div>
+
+          <div className="mt-4 grid gap-4 lg:grid-cols-3">
+            {/* Inputs */}
+            <div className="rounded-xl border border-slate-800 bg-slate-950/30 p-4">
+              <p className="text-xs font-medium text-slate-300">Inputs</p>
+
+              <label className="mt-3 block text-[0.7rem] text-slate-400">
+                EV ID
+              </label>
+              <input
+                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950/50 px-3 py-2 text-sm text-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
+                value={evId}
+                onChange={(e) => setEvId(e.target.value)}
+                placeholder="EV123"
+              />
+
+              <label className="mt-3 block text-[0.7rem] text-slate-400">
+                Power Required (kW)
+              </label>
+              <input
+                type="number"
+                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950/50 px-3 py-2 text-sm text-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
+                value={powerRequired}
+                onChange={(e) => setPowerRequired(Number(e.target.value))}
+              />
+
+              <label className="mt-3 block text-[0.7rem] text-slate-400">
+                Session ID
+              </label>
+              <input
+                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950/50 px-3 py-2 text-xs font-mono text-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
+                value={sessionId}
+                onChange={(e) => setSessionId(e.target.value)}
+                placeholder="(auto-filled after start)"
+              />
+
+              <label className="mt-3 block text-[0.7rem] text-slate-400">
+                Resume Token
+              </label>
+              <textarea
+                className="mt-1 w-full min-h-[70px] resize-y rounded-lg border border-slate-700 bg-slate-950/50 px-3 py-2 text-xs font-mono text-slate-50 focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
+                value={resumeToken}
+                onChange={(e) => setResumeToken(e.target.value)}
+                placeholder="(auto-filled after start/resume)"
+              />
+              <p className="mt-2 text-[0.7rem] text-slate-500">
+                Token rotates on resume. Old token should fail after rotation.
+              </p>
+            </div>
+
+            {/* Actions */}
+            <div className="rounded-xl border border-slate-800 bg-slate-950/30 p-4">
+              <p className="text-xs font-medium text-slate-300">Actions</p>
+
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <button
+                  onClick={doStart}
+                  className="rounded-lg bg-emerald-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-emerald-400"
+                >
+                  Start
+                </button>
+                <button
+                  onClick={doPause}
+                  className="rounded-lg border border-slate-700 bg-slate-950/40 px-3 py-2 text-xs font-semibold hover:bg-slate-900"
+                >
+                  Pause
+                </button>
+                <button
+                  onClick={doResume}
+                  className="rounded-lg border border-slate-700 bg-slate-950/40 px-3 py-2 text-xs font-semibold hover:bg-slate-900"
+                >
+                  Resume
+                </button>
+                <button
+                  onClick={doStop}
+                  className="rounded-lg border border-red-700/70 bg-red-500/10 px-3 py-2 text-xs font-semibold text-red-200 hover:bg-red-500/20"
+                >
+                  Stop
+                </button>
+              </div>
+
+              <div className="mt-4 rounded-lg border border-slate-800 bg-slate-950/40 p-3">
+                <p className="text-[0.7rem] text-slate-400">Current session</p>
+                <p className="mt-1 text-xs text-slate-200">
+                  Status: <span className="font-mono">{sessionStatus}</span>
+                </p>
+                <p className="mt-1 text-xs text-slate-200">
+                  Expires:{" "}
+                  <span className="font-mono break-all">{expiresAt}</span>
+                </p>
+              </div>
+
+              <details className="mt-3">
+                <summary className="cursor-pointer text-xs text-slate-400">
+                  DB health details
+                </summary>
+                <pre className="mt-2 whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-950/50 p-3 text-[0.7rem] text-slate-200">
+                  {dbHealthDetail || "(none)"}
+                </pre>
+              </details>
+            </div>
+
+            {/* API output */}
+            <div className="rounded-xl border border-slate-800 bg-slate-950/30 p-4">
+              <p className="text-xs font-medium text-slate-300">API output</p>
+              <pre className="mt-3 max-h-[360px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-950/50 p-3 text-[0.7rem] text-slate-200">
+                {apiLog || "(no calls yet)"}
+              </pre>
+            </div>
+          </div>
+        </section>
+
+        {/* Existing: Input + filter */}
         <section className="grid gap-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
           {/* Write to ledger */}
           <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-4">
             <h2 className="text-sm font-semibold text-slate-200">
-              Submit event to ledger
+              Submit event to ledger (Fabric)
             </h2>
             <p className="mt-1 text-xs text-slate-400">
-              This will invoke <code>LogEvent(ctx, payload)</code> on the{" "}
-              <code>ev-contract</code> chaincode.
+              This calls <code>POST /api/log</code> and broadcasts over SSE.
             </p>
 
             <textarea
@@ -177,7 +505,7 @@ function App() {
                 <span>Send to ledger</span>
               </button>
               <span className="text-[0.7rem] text-slate-500">
-                Transactions are ordered by Fabric and stored with tx ID keys.
+                Fabric tx ID shows up in the event stream below.
               </span>
             </div>
           </div>
@@ -203,7 +531,7 @@ function App() {
         <section className="rounded-xl border border-slate-800 bg-slate-900/80">
           <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
             <h2 className="text-sm font-semibold text-slate-200">
-              Recent ledger events
+              Recent ledger events (SSE)
             </h2>
             <span className="text-[0.7rem] text-slate-500">
               Showing {filteredEvents.length} of {events.length}
@@ -233,20 +561,24 @@ function App() {
                 <tbody>
                   {filteredEvents.map((evt, idx) => {
                     const rec = evt.payload || {};
-                    let payloadMessage = "";
-                    try {
-                      if (rec.payload) {
-                        const parsed = JSON.parse(rec.payload);
-                        payloadMessage = parsed.message || rec.payload;
-                      }
-                    } catch {
-                      payloadMessage = rec.payload || "";
-                    }
-
                     const ts = rec.timestamp || "—";
                     const txFull = rec.txId || evt.txId || "";
                     const txShort =
                       txFull.length > 16 ? `${txFull.slice(0, 16)}…` : txFull;
+
+                    // Your record payload is likely just "payload" as a string (your UI sends raw message)
+                    let payloadMessage = "";
+                    try {
+                      if (rec.payload) {
+                        const parsed = JSON.parse(rec.payload);
+                        payloadMessage =
+                          parsed.message ||
+                          parsed.eventType ||
+                          JSON.stringify(parsed);
+                      }
+                    } catch {
+                      payloadMessage = rec.payload || "";
+                    }
 
                     return (
                       <tr

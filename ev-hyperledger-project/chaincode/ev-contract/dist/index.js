@@ -4,9 +4,6 @@ exports.contracts = exports.EvContract = void 0;
 const fabric_contract_api_1 = require("fabric-contract-api");
 class EvContract extends fabric_contract_api_1.Contract {
     constructor() {
-        // IMPORTANT: This contract name MUST match:
-        // network.getContract("ev-contract")
-        // AND your deployCC -ccn ev-contract
         super("ev-contract");
     }
     async WriteSession(ctx, sessionId, source, payload) {
