@@ -127,37 +127,45 @@ app.post("/api/log", async (req: Request, res: Response) => {
         .json({ error: "Fabric not initialized (still ok for DB endpoints)" });
     }
 
-    const { sessionId, source, payload } = req.body;
+    const { sessionId, source, payload, evId } = req.body;
 
-    if (!sessionId || !source || !payload) {
+    if (!sessionId || !source || payload === undefined) {
       return res
         .status(400)
         .json({ error: "sessionId, source, and payload are required" });
     }
 
-    const tx = contract.createTransaction("WriteSession");
+    // fallbacks
+    const _evId = evId || "EV_UNKNOWN";
+    const eventType = "log";
 
-    let txId: string;
-    if (typeof tx.getTransactionId === "function") {
-      const raw = tx.getTransactionId();
+    const tx = contract.createTransaction("AppendSessionEvent");
+
+    // try to get txId early for UI display
+    let txId = "UNKNOWN_TX";
+    try {
+      const raw = tx.getTransactionId?.();
       txId =
         raw?.getTransactionID?.() || raw?.transactionId || raw || "UNKNOWN_TX";
-    } else {
-      txId = "UNKNOWN_TX";
-    }
+    } catch {}
 
-    await tx.submit(sessionId, source, payload);
+    // IMPORTANT: payload must be string
+    const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
+
+    // NEW SIGNATURE: (sessionId, evId, eventType, source, payload)
+    await tx.submit(sessionId, _evId, eventType, source, payloadStr);
 
     const record = {
       sessionId,
+      evId: _evId,
+      eventType,
       source,
-      payload,
+      payload: payloadStr,
       timestamp: new Date().toISOString(),
       txId,
     };
 
-    // ✅ broadcast so UI sees it
-    broadcastSSE({ eventName: "WriteSession", txId, payload: record });
+    broadcastSSE({ eventName: "AppendSessionEvent", txId, payload: record });
 
     return res.json({ ok: true, txId });
   } catch (err: any) {
@@ -165,6 +173,7 @@ app.post("/api/log", async (req: Request, res: Response) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
 
 /** ---------------- SSE endpoint (reliable: flush + heartbeat) ---------------- */
 app.get("/events", (req: Request, res: Response) => {

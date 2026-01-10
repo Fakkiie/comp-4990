@@ -1,16 +1,14 @@
 import { supabase } from "./supabase";
 
 /**
- * Writes an audit event to Fabric AND stores (txId + eventKey) into Postgres session_ledger_events.
+ * Writes an audit event to Fabric (AppendSessionEvent) AND stores (txId + eventKey) into Postgres session_ledger_events.
  *
- * IMPORTANT:
- * Your chaincode WriteSession(ctx, sessionId, ...) throws if the key already exists.
- * So we must use a UNIQUE key per event when calling WriteSession.
+ * Chaincode signature:
+ *   AppendSessionEvent(sessionId, evId, eventType, source, payloadStr) -> returns eventKey (string)
  *
- * We do:
- *   fabricKey = `${sessionId}:${eventType}:${Date.now()}`
- *
- * And include the "real" sessionId inside the payload JSON.
+ * We keep:
+ * - best-effort Fabric write (don't break API if Fabric fails)
+ * - insert txId into DB if present
  */
 export async function logLedgerEvent(opts: {
   contract: any | null;
@@ -22,46 +20,62 @@ export async function logLedgerEvent(opts: {
   const { contract, sessionId, eventType, payload } = opts;
   const source = opts.source ?? "SECC";
 
-  const eventKey = `${sessionId}:${eventType}:${Date.now()}`;
+  // Try to infer evId (your routes include it in payload)
+  const evId: string = payload?.evId ?? "EV_UNKNOWN";
+
   let txId: string | null = null;
+  let eventKey: string | null = null;
 
   // 1) Write to Fabric (best-effort; don't break API if Fabric fails)
   try {
     if (contract) {
-      const tx = contract.createTransaction("WriteSession");
+      const tx = contract.createTransaction("AppendSessionEvent");
 
+      // best-effort tx id extraction (depends on gateway version)
       const raw =
         typeof tx.getTransactionId === "function" ? tx.getTransactionId() : null;
 
       txId =
         raw?.getTransactionID?.() ||
         raw?.transactionId ||
-        raw ||
+        (typeof raw === "string" ? raw : null) ||
         null;
 
-      await tx.submit(
-        eventKey, // <-- unique world-state key
+      // Ensure payload is a string
+      const payloadStr =
+        typeof payload === "string"
+          ? payload
+          : JSON.stringify({
+              sessionId,
+              evId,
+              eventType,
+              ...payload,
+            });
+
+      // NEW: chaincode returns the ledger key
+      const resp: Buffer = await tx.submit(
+        sessionId,
+        evId,
+        eventType,
         source,
-        JSON.stringify({
-          sessionId,   // <-- real session id preserved
-          eventType,
-          eventKey,
-          ...payload,
-        })
+        payloadStr
       );
+
+      eventKey = resp?.toString("utf8") || null;
     }
   } catch (e: any) {
-    console.error("Fabric WriteSession failed:", e?.message ?? e);
+    console.error("Fabric AppendSessionEvent failed:", e?.message ?? e);
     txId = null;
+    eventKey = null;
   }
 
-  // 2) Store txId in DB if we have it
+  // 2) Store txId in DB if we have it (and store eventKey too if available)
   if (txId) {
     const { error } = await supabase.from("session_ledger_events").insert({
       session_id: sessionId,
       event_type: eventType,
       tx_id: txId,
-      payload: { ...payload, eventKey }, // helpful for debugging
+      payload: { ...payload, eventKey }, // keep for debugging
     });
 
     if (error) {
