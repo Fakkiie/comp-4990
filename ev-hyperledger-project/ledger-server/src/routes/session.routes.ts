@@ -1,12 +1,88 @@
 import { Router, Request, Response } from "express";
 import { supabase } from "../lib/supabase";
 import { generateResumeToken, hashToken } from "../lib/tokens";
-import { logLedgerEvent } from "../lib/fabricLogger";
+import { queueLedgerEvent } from "../lib/ledgerQueue";
 
 type ContractRef = { get: () => any | null };
 type Broadcaster = (data: any) => void;
 
-function nowIso() {
+//in memory session cache
+interface CachedSession {
+  session_id: string;
+  ev_id: string;
+  power_required: number;
+  power_consumed: number;
+  cost: number;
+  status: string;
+  expires_at: string;
+  cached_at: number;
+}
+
+const sessionCache = new Map<string, CachedSession>();
+const CACHE_TTL_MS = 60 * 1000;
+
+function getCacheKey(sessionId: string, evId: string): string {
+  return `${sessionId}:${evId}`;
+}
+
+async function getSessionCached(
+  sessionId: string,
+  evId: string
+): Promise<CachedSession | null> {
+  const key = getCacheKey(sessionId, evId);
+  const cached = sessionCache.get(key);
+
+  if (cached && Date.now() - cached.cached_at < CACHE_TTL_MS) {
+    return cached;
+  }
+
+  const { data, error } = await supabase
+    .from("charging_sessions")
+    .select(
+      "session_id, ev_id, power_required, power_consumed, cost, status, expires_at"
+    )
+    .eq("session_id", sessionId)
+    .eq("ev_id", evId)
+    .single();
+
+  if (error || !data) return null;
+
+  const session: CachedSession = { ...data, cached_at: Date.now() };
+  sessionCache.set(key, session);
+  return session;
+}
+
+function invalidateSessionCache(sessionId: string, evId: string): void {
+  sessionCache.delete(getCacheKey(sessionId, evId));
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of sessionCache) {
+    if (now - value.cached_at > CACHE_TTL_MS) {
+      sessionCache.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
+//status helpers
+const TERMINAL_STATES = ["stopped", "expired"];
+const RESUMABLE_STATES = ["paused", "disconnected"];
+const ACTIVE_STATES = ["active", "charging"];
+
+function isTerminal(status: string): boolean {
+  return TERMINAL_STATES.includes(status);
+}
+
+function isResumable(status: string): boolean {
+  return RESUMABLE_STATES.includes(status);
+}
+
+function isActive(status: string): boolean {
+  return ACTIVE_STATES.includes(status);
+}
+
+function nowIso(): string {
   return new Date().toISOString();
 }
 
@@ -14,55 +90,21 @@ function isExpired(expiresAt: string): boolean {
   return Date.now() >= new Date(expiresAt).getTime();
 }
 
-// ============ KEY FIX: Define session states ============
-// Terminal states - session is dead, cannot be resumed
-const TERMINAL_STATES = ["stopped", "expired"] as const;
+//sse emitter helper
 
-// States that allow resumption
-const RESUMABLE_STATES = ["paused", "disconnected"] as const;
-
-// States that are actively charging (can only stop, not resume)
-const ACTIVE_STATES = ["active", "charging"] as const;
-
-type SessionStatus = "active" | "charging" | "paused" | "disconnected" | "stopped" | "expired";
-
-function isTerminal(status: string): boolean {
-  return TERMINAL_STATES.includes(status as any);
-}
-
-function isResumable(status: string): boolean {
-  return RESUMABLE_STATES.includes(status as any);
-}
-
-function isActive(status: string): boolean {
-  return ACTIVE_STATES.includes(status as any);
-}
-// ========================================================
-
-async function expireIfNeeded(sessionId: string, expiresAt: string) {
-  if (!isExpired(expiresAt)) return false;
-  await supabase
-    .from("charging_sessions")
-    .update({ status: "expired" })
-    .eq("session_id", sessionId);
-  return true;
-}
-
-/**
- * Emit SSE in the exact shape your UI already expects:
- * { eventName, txId, payload: { timestamp, txId, payload: string } }
- */
-function emit(broadcast: Broadcaster | undefined, eventName: string, txId: string | null, obj: any) {
+function emit(broadcast: Broadcaster | undefined, eventName: string, obj: any) {
   broadcast?.({
     eventName,
-    txId: txId ?? "",
+    txId: "pending",
     payload: {
-      timestamp: new Date().toISOString(),
-      txId: txId ?? "",
+      timestamp: nowIso(),
+      txId: "pending",
       payload: JSON.stringify(obj),
     },
   });
 }
+
+//session routes
 
 export function createSessionsRouter(
   contractRef: ContractRef,
@@ -70,10 +112,16 @@ export function createSessionsRouter(
 ) {
   const router = Router();
 
-  /** POST /api/sessions/start */
+  //router start function
   router.post("/start", async (req: Request, res: Response) => {
+    const startTime = Date.now();
+
     try {
-      const { evId, powerRequired, hours = 6 } = req.body as {
+      const {
+        evId,
+        powerRequired,
+        hours = 6,
+      } = req.body as {
         evId?: string;
         powerRequired?: number;
         hours?: number;
@@ -88,8 +136,11 @@ export function createSessionsRouter(
           .json({ ok: false, error: "powerRequired must be a number" });
       }
 
-      const expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+      const expiresAt = new Date(
+        Date.now() + hours * 60 * 60 * 1000
+      ).toISOString();
 
+      //create session in Supabase
       const { data: session, error: sErr } = await supabase
         .from("charging_sessions")
         .insert({
@@ -112,36 +163,47 @@ export function createSessionsRouter(
         });
       }
 
+      //create resume token
       const resumeToken = generateResumeToken();
       const tokenHash = hashToken(resumeToken);
 
-      const { error: tErr } = await supabase.from("session_resume_tokens").insert({
-        session_id: session.session_id,
-        token_hash: tokenHash,
-        expires_at: expiresAt,
-        revoked_at: null,
-      });
+      const { error: tErr } = await supabase
+        .from("session_resume_tokens")
+        .insert({
+          session_id: session.session_id,
+          token_hash: tokenHash,
+          expires_at: expiresAt,
+          revoked_at: null,
+        });
 
       if (tErr) {
         return res.status(500).json({ ok: false, error: tErr.message });
       }
 
-      const { txId, eventKey } = await logLedgerEvent({
-        contract: contractRef.get(),
-        sessionId: session.session_id,
-        eventType: "SessionStarted",
-        payload: { evId, powerRequired, expiresAt, tokenHash },
-      });
+      //queue ledger write
+      const { queued, queueId } = await queueLedgerEvent(
+        session.session_id,
+        evId,
+        "SessionStarted",
+        { evId, powerRequired, expiresAt, tokenHash }
+      );
 
-      emit(broadcast, "SessionStarted", txId, {
+      //emit event
+      emit(broadcast, "SessionStarted", {
         eventType: "SessionStarted",
         sessionId: session.session_id,
         evId,
         powerRequired,
         expiresAt,
         status: "active",
-        eventKey,
+        queued,
+        queueId,
       });
+
+      const duration = Date.now() - startTime;
+      console.log(
+        `[START] ${session.session_id} completed in ${duration}ms (queued: ${queued})`
+      );
 
       return res.json({
         ok: true,
@@ -155,180 +217,43 @@ export function createSessionsRouter(
           expiresAt: session.expires_at,
         },
         resumeToken,
-        txId,
-        eventKey,
+        txId: "pending",
+        queueId,
       });
     } catch (e: any) {
-      return res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+      return res
+        .status(500)
+        .json({ ok: false, error: e?.message ?? String(e) });
     }
   });
 
-  /** 
-   * POST /api/sessions/stop
-   * 
-   * ============ KEY FIX ============
-   * Stop TERMINATES the session permanently.
-   * - Status becomes "stopped" (not "disconnected")
-   * - All resume tokens are revoked
-   * - Session cannot be resumed after this
-   * =================================
-   */
-  router.post("/stop", async (req: Request, res: Response) => {
-    try {
-      const { evId, sessionId } = req.body as { evId?: string; sessionId?: string };
-
-      if (!evId || typeof evId !== "string") {
-        return res.status(400).json({ ok: false, error: "evId is required" });
-      }
-      if (!sessionId || typeof sessionId !== "string") {
-        return res.status(400).json({ ok: false, error: "sessionId is required" });
-      }
-
-      const { data: session, error: sErr } = await supabase
-        .from("charging_sessions")
-        .select(
-          "session_id, ev_id, power_required, power_consumed, cost, status, expires_at"
-        )
-        .eq("session_id", sessionId)
-        .eq("ev_id", evId)
-        .single();
-
-      if (sErr || !session) {
-        return res.status(404).json({ ok: false, error: "Session not found" });
-      }
-
-      // Check if already terminated
-      if (isTerminal(session.status)) {
-        return res.status(400).json({
-          ok: false,
-          error: `Session already ${session.status}`,
-        });
-      }
-
-      // Check expiry
-      const expired = await expireIfNeeded(sessionId, session.expires_at);
-      if (expired) {
-        const { txId, eventKey } = await logLedgerEvent({
-          contract: contractRef.get(),
-          sessionId,
-          eventType: "SessionExpired",
-          payload: { evId },
-        });
-        emit(broadcast, "SessionExpired", txId, {
-          eventType: "SessionExpired",
-          sessionId,
-          evId,
-          status: "expired",
-          eventKey,
-        });
-        return res.status(410).json({
-          ok: false,
-          error: "Session expired",
-          txId,
-          eventKey,
-        });
-      }
-
-      // ============ KEY FIX: Set status to "stopped" (terminal) ============
-      const { data: updated, error: uErr } = await supabase
-        .from("charging_sessions")
-        .update({ status: "stopped" })  // <-- CHANGED from "disconnected"
-        .eq("session_id", sessionId)
-        .eq("ev_id", evId)
-        .select(
-          "session_id, ev_id, power_required, power_consumed, cost, status, expires_at"
-        )
-        .single();
-
-      if (uErr || !updated) {
-        return res.status(500).json({
-          ok: false,
-          error: uErr?.message || "Failed to stop session",
-        });
-      }
-
-      // ============ KEY FIX: Revoke ALL resume tokens ============
-      const { error: revokeErr } = await supabase
-        .from("session_resume_tokens")
-        .update({ revoked_at: nowIso() })
-        .eq("session_id", sessionId)
-        .is("revoked_at", null);
-
-      if (revokeErr) {
-        console.error("Failed to revoke tokens:", revokeErr.message);
-        // Don't fail the request, session is already stopped
-      }
-      // ============================================================
-
-      const { txId, eventKey } = await logLedgerEvent({
-        contract: contractRef.get(),
-        sessionId,
-        eventType: "SessionStopped",
-        payload: { evId, finalStatus: "stopped" },
-      });
-
-      emit(broadcast, "SessionStopped", txId, {
-        eventType: "SessionStopped",
-        sessionId,
-        evId,
-        status: "stopped",
-        eventKey,
-      });
-
-      return res.json({
-        ok: true,
-        session: {
-          evId: updated.ev_id,
-          sessionId: updated.session_id,
-          powerRequired: updated.power_required,
-          powerConsumed: updated.power_consumed,
-          cost: updated.cost,
-          status: updated.status,
-          expiresAt: updated.expires_at,
-        },
-        txId,
-        eventKey,
-      });
-    } catch (e: any) {
-      return res.status(500).json({ ok: false, error: e?.message ?? String(e) });
-    }
-  });
-
-  /**
-   * POST /api/sessions/pause (NEW - optional)
-   * 
-   * If you want a "soft stop" that allows resume, use this instead.
-   * Sets status to "paused" or "disconnected" which CAN be resumed.
-   */
+  //pause session
   router.post("/pause", async (req: Request, res: Response) => {
     try {
-      const { evId, sessionId } = req.body as { evId?: string; sessionId?: string };
+      const { evId, sessionId } = req.body as {
+        evId?: string;
+        sessionId?: string;
+      };
 
       if (!evId || typeof evId !== "string") {
         return res.status(400).json({ ok: false, error: "evId is required" });
       }
       if (!sessionId || typeof sessionId !== "string") {
-        return res.status(400).json({ ok: false, error: "sessionId is required" });
+        return res
+          .status(400)
+          .json({ ok: false, error: "sessionId is required" });
       }
 
-      const { data: session, error: sErr } = await supabase
-        .from("charging_sessions")
-        .select(
-          "session_id, ev_id, power_required, power_consumed, cost, status, expires_at"
-        )
-        .eq("session_id", sessionId)
-        .eq("ev_id", evId)
-        .single();
+      const session = await getSessionCached(sessionId, evId);
 
-      if (sErr || !session) {
+      if (!session) {
         return res.status(404).json({ ok: false, error: "Session not found" });
       }
 
       if (isTerminal(session.status)) {
-        return res.status(400).json({
-          ok: false,
-          error: `Session already ${session.status} - cannot pause`,
-        });
+        return res
+          .status(400)
+          .json({ ok: false, error: `Session already ${session.status}` });
       }
 
       if (!isActive(session.status)) {
@@ -338,12 +263,15 @@ export function createSessionsRouter(
         });
       }
 
-      const expired = await expireIfNeeded(sessionId, session.expires_at);
-      if (expired) {
+      if (isExpired(session.expires_at)) {
+        await supabase
+          .from("charging_sessions")
+          .update({ status: "expired" })
+          .eq("session_id", sessionId);
+        invalidateSessionCache(sessionId, evId);
         return res.status(410).json({ ok: false, error: "Session expired" });
       }
 
-      // Set to "disconnected" (resumable state)
       const { data: updated, error: uErr } = await supabase
         .from("charging_sessions")
         .update({ status: "disconnected" })
@@ -361,19 +289,23 @@ export function createSessionsRouter(
         });
       }
 
-      const { txId, eventKey } = await logLedgerEvent({
-        contract: contractRef.get(),
-        sessionId,
-        eventType: "SessionPaused",
-        payload: { evId },
-      });
+      invalidateSessionCache(sessionId, evId);
 
-      emit(broadcast, "SessionPaused", txId, {
+      //queue ledger write
+      const { queued, queueId } = await queueLedgerEvent(
+        sessionId,
+        evId,
+        "SessionPaused",
+        { evId }
+      );
+
+      emit(broadcast, "SessionPaused", {
         eventType: "SessionPaused",
         sessionId,
         evId,
         status: "disconnected",
-        eventKey,
+        queued,
+        queueId,
       });
 
       return res.json({
@@ -387,26 +319,17 @@ export function createSessionsRouter(
           status: updated.status,
           expiresAt: updated.expires_at,
         },
-        txId,
-        eventKey,
+        txId: "pending",
+        queueId,
       });
     } catch (e: any) {
-      return res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+      return res
+        .status(500)
+        .json({ ok: false, error: e?.message ?? String(e) });
     }
   });
 
-  /**
-   * POST /api/sessions/resume
-   * 
-   * ============ KEY FIX ============
-   * Resume only works if:
-   * 1. Session exists
-   * 2. Session is NOT in a terminal state (stopped/expired)
-   * 3. Session IS in a resumable state (paused/disconnected)
-   * 4. Session is not expired (check expiresAt)
-   * 5. Resume token is valid and not revoked
-   * =================================
-   */
+  //resume session
   router.post("/resume", async (req: Request, res: Response) => {
     try {
       const { evId, sessionId, resumeToken } = req.body as {
@@ -419,36 +342,29 @@ export function createSessionsRouter(
         return res.status(400).json({ ok: false, error: "evId is required" });
       }
       if (!sessionId || typeof sessionId !== "string") {
-        return res.status(400).json({ ok: false, error: "sessionId is required" });
+        return res
+          .status(400)
+          .json({ ok: false, error: "sessionId is required" });
       }
       if (!resumeToken || typeof resumeToken !== "string") {
-        return res.status(400).json({ ok: false, error: "resumeToken is required" });
+        return res
+          .status(400)
+          .json({ ok: false, error: "resumeToken is required" });
       }
 
-      const { data: session, error: sErr } = await supabase
-        .from("charging_sessions")
-        .select(
-          "session_id, ev_id, power_required, power_consumed, cost, status, expires_at"
-        )
-        .eq("session_id", sessionId)
-        .eq("ev_id", evId)
-        .single();
+      const session = await getSessionCached(sessionId, evId);
 
-      if (sErr || !session) {
+      if (!session) {
         return res.status(404).json({ ok: false, error: "Session not found" });
       }
 
-      // ============ KEY FIX: Check if session is in terminal state ============
       if (isTerminal(session.status)) {
         return res.status(400).json({
           ok: false,
           error: `Session is ${session.status} - cannot resume a terminated session`,
         });
       }
-      // ========================================================================
 
-      // ============ KEY FIX: Check if session is resumable ============
-      // If session is already active, no need to resume
       if (isActive(session.status)) {
         return res.status(400).json({
           ok: false,
@@ -456,40 +372,32 @@ export function createSessionsRouter(
         });
       }
 
-      // At this point, status should be "paused" or "disconnected"
       if (!isResumable(session.status)) {
         return res.status(400).json({
           ok: false,
           error: `Session status "${session.status}" does not allow resumption`,
         });
       }
-      // ================================================================
 
-      // Check expiry
-      const expired = await expireIfNeeded(sessionId, session.expires_at);
-      if (expired) {
-        const { txId, eventKey } = await logLedgerEvent({
-          contract: contractRef.get(),
-          sessionId,
-          eventType: "SessionExpired",
-          payload: { evId },
-        });
-        emit(broadcast, "SessionExpired", txId, {
+      if (isExpired(session.expires_at)) {
+        await supabase
+          .from("charging_sessions")
+          .update({ status: "expired" })
+          .eq("session_id", sessionId);
+        invalidateSessionCache(sessionId, evId);
+
+        await queueLedgerEvent(sessionId, evId, "SessionExpired", { evId });
+        emit(broadcast, "SessionExpired", {
           eventType: "SessionExpired",
           sessionId,
           evId,
           status: "expired",
-          eventKey,
         });
-        return res.status(410).json({
-          ok: false,
-          error: "Session expired",
-          txId,
-          eventKey,
-        });
+
+        return res.status(410).json({ ok: false, error: "Session expired" });
       }
 
-      // Validate token
+      //validate resume token
       const tokenHash = hashToken(resumeToken);
       const { data: tokenRow, error: tErr } = await supabase
         .from("session_resume_tokens")
@@ -500,14 +408,16 @@ export function createSessionsRouter(
         .single();
 
       if (tErr || !tokenRow) {
-        return res.status(401).json({ ok: false, error: "Invalid or revoked token" });
+        return res
+          .status(401)
+          .json({ ok: false, error: "Invalid or revoked token" });
       }
 
       if (isExpired(tokenRow.expires_at)) {
         return res.status(401).json({ ok: false, error: "Token expired" });
       }
 
-      // Rotate token (revoke old, create new)
+      //generate new token and revoke old
       const newToken = generateResumeToken();
       const newHash = hashToken(newToken);
 
@@ -516,18 +426,19 @@ export function createSessionsRouter(
         .update({ revoked_at: nowIso() })
         .eq("id", tokenRow.id);
 
-      const { error: insErr } = await supabase.from("session_resume_tokens").insert({
-        session_id: sessionId,
-        token_hash: newHash,
-        expires_at: session.expires_at,
-        revoked_at: null,
-      });
+      const { error: insErr } = await supabase
+        .from("session_resume_tokens")
+        .insert({
+          session_id: sessionId,
+          token_hash: newHash,
+          expires_at: session.expires_at,
+          revoked_at: null,
+        });
 
       if (insErr) {
         return res.status(500).json({ ok: false, error: insErr.message });
       }
 
-      // Reactivate session
       const { data: updated, error: uErr } = await supabase
         .from("charging_sessions")
         .update({ status: "active" })
@@ -545,19 +456,23 @@ export function createSessionsRouter(
         });
       }
 
-      const { txId, eventKey } = await logLedgerEvent({
-        contract: contractRef.get(),
-        sessionId,
-        eventType: "SessionResumed",
-        payload: { evId },
-      });
+      invalidateSessionCache(sessionId, evId);
 
-      emit(broadcast, "SessionResumed", txId, {
+      //queue ledger write
+      const { queued, queueId } = await queueLedgerEvent(
+        sessionId,
+        evId,
+        "SessionResumed",
+        { evId }
+      );
+
+      emit(broadcast, "SessionResumed", {
         eventType: "SessionResumed",
         sessionId,
         evId,
         status: "active",
-        eventKey,
+        queued,
+        queueId,
       });
 
       return res.json({
@@ -572,11 +487,127 @@ export function createSessionsRouter(
           expiresAt: updated.expires_at,
         },
         resumeToken: newToken,
-        txId,
-        eventKey,
+        txId: "pending",
+        queueId,
       });
     } catch (e: any) {
-      return res.status(500).json({ ok: false, error: e?.message ?? String(e) });
+      return res
+        .status(500)
+        .json({ ok: false, error: e?.message ?? String(e) });
+    }
+  });
+
+  //stop session
+  router.post("/stop", async (req: Request, res: Response) => {
+    try {
+      const { evId, sessionId } = req.body as {
+        evId?: string;
+        sessionId?: string;
+      };
+
+      if (!evId || typeof evId !== "string") {
+        return res.status(400).json({ ok: false, error: "evId is required" });
+      }
+      if (!sessionId || typeof sessionId !== "string") {
+        return res
+          .status(400)
+          .json({ ok: false, error: "sessionId is required" });
+      }
+
+      const session = await getSessionCached(sessionId, evId);
+
+      if (!session) {
+        return res.status(404).json({ ok: false, error: "Session not found" });
+      }
+
+      if (isTerminal(session.status)) {
+        return res
+          .status(400)
+          .json({ ok: false, error: `Session already ${session.status}` });
+      }
+
+      if (isExpired(session.expires_at)) {
+        await supabase
+          .from("charging_sessions")
+          .update({ status: "expired" })
+          .eq("session_id", sessionId);
+        invalidateSessionCache(sessionId, evId);
+
+        await queueLedgerEvent(sessionId, evId, "SessionExpired", { evId });
+        emit(broadcast, "SessionExpired", {
+          eventType: "SessionExpired",
+          sessionId,
+          evId,
+          status: "expired",
+        });
+
+        return res.status(410).json({ ok: false, error: "Session expired" });
+      }
+
+      const { data: updated, error: uErr } = await supabase
+        .from("charging_sessions")
+        .update({ status: "stopped" })
+        .eq("session_id", sessionId)
+        .eq("ev_id", evId)
+        .select(
+          "session_id, ev_id, power_required, power_consumed, cost, status, expires_at"
+        )
+        .single();
+
+      if (uErr || !updated) {
+        return res.status(500).json({
+          ok: false,
+          error: uErr?.message || "Failed to stop session",
+        });
+      }
+
+      //revoke all resume tokens
+      await supabase
+        .from("session_resume_tokens")
+        .update({ revoked_at: nowIso() })
+        .eq("session_id", sessionId)
+        .is("revoked_at", null);
+
+      invalidateSessionCache(sessionId, evId);
+
+      //queue ledger write
+      const { queued, queueId } = await queueLedgerEvent(
+        sessionId,
+        evId,
+        "SessionStopped",
+        {
+          evId,
+          finalStatus: "stopped",
+        }
+      );
+
+      emit(broadcast, "SessionStopped", {
+        eventType: "SessionStopped",
+        sessionId,
+        evId,
+        status: "stopped",
+        queued,
+        queueId,
+      });
+
+      return res.json({
+        ok: true,
+        session: {
+          evId: updated.ev_id,
+          sessionId: updated.session_id,
+          powerRequired: updated.power_required,
+          powerConsumed: updated.power_consumed,
+          cost: updated.cost,
+          status: updated.status,
+          expiresAt: updated.expires_at,
+        },
+        txId: "pending",
+        queueId,
+      });
+    } catch (e: any) {
+      return res
+        .status(500)
+        .json({ ok: false, error: e?.message ?? String(e) });
     }
   });
 

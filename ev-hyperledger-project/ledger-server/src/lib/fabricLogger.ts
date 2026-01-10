@@ -1,37 +1,27 @@
 import { supabase } from "./supabase";
-
-/**
- * Writes an audit event to Fabric (AppendSessionEvent) AND stores (txId + eventKey) into Postgres session_ledger_events.
- *
- * Chaincode signature:
- *   AppendSessionEvent(sessionId, evId, eventType, source, payloadStr) -> returns eventKey (string)
- *
- * We keep:
- * - best-effort Fabric write (don't break API if Fabric fails)
- * - insert txId into DB if present
- */
+//writes an audit event to both Fabric and Supabase
 export async function logLedgerEvent(opts: {
   contract: any | null;
   sessionId: string;
-  eventType: string; // SessionStarted/SessionStopped/SessionResumed/SessionExpired
-  payload: any;      // jsonb
-  source?: string;   // default "SECC"
+  eventType: string; 
+  payload: any;      
+  source?: string;   
 }) {
   const { contract, sessionId, eventType, payload } = opts;
   const source = opts.source ?? "SECC";
 
-  // Try to infer evId (your routes include it in payload)
+  //extract evid from payload if available
   const evId: string = payload?.evId ?? "EV_UNKNOWN";
 
   let txId: string | null = null;
   let eventKey: string | null = null;
 
-  // 1) Write to Fabric (best-effort; don't break API if Fabric fails)
+  //write to Fabric
   try {
     if (contract) {
       const tx = contract.createTransaction("AppendSessionEvent");
 
-      // best-effort tx id extraction (depends on gateway version)
+      //xxtract txId
       const raw =
         typeof tx.getTransactionId === "function" ? tx.getTransactionId() : null;
 
@@ -41,7 +31,7 @@ export async function logLedgerEvent(opts: {
         (typeof raw === "string" ? raw : null) ||
         null;
 
-      // Ensure payload is a string
+      //ensure payload is string
       const payloadStr =
         typeof payload === "string"
           ? payload
@@ -52,7 +42,7 @@ export async function logLedgerEvent(opts: {
               ...payload,
             });
 
-      // NEW: chaincode returns the ledger key
+      //return ledger key
       const resp: Buffer = await tx.submit(
         sessionId,
         evId,
@@ -69,13 +59,13 @@ export async function logLedgerEvent(opts: {
     eventKey = null;
   }
 
-  // 2) Store txId in DB if we have it (and store eventKey too if available)
+  //store txId and eventKey in Supabase for auditing
   if (txId) {
     const { error } = await supabase.from("session_ledger_events").insert({
       session_id: sessionId,
       event_type: eventType,
       tx_id: txId,
-      payload: { ...payload, eventKey }, // keep for debugging
+      payload: { ...payload, eventKey }, 
     });
 
     if (error) {

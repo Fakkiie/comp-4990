@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 
-/** ---------------- Types ---------------- */
-type SessionStatus = "active" | "charging" | "paused" | "disconnected" | "stopped" | "expired" | string;
+type SessionStatus =
+  | "active"
+  | "charging"
+  | "paused"
+  | "disconnected"
+  | "stopped"
+  | "expired"
+  | string;
 
 interface EventRecord {
   timestamp?: string;
   txId?: string;
-  payload?: string; // JSON string
+  payload?: string;
 }
 
 interface IncomingEvent {
@@ -34,11 +40,10 @@ interface SessionResponse {
 
 type DbHealth = "unknown" | "ok" | "fail";
 
-/** ---------------- Config ---------------- */
 const API_BASE =
-  (import.meta as any)?.env?.VITE_API_BASE?.toString() || "http://localhost:4000";
+  (import.meta as any)?.env?.VITE_API_BASE?.toString() ||
+  "http://localhost:4000";
 
-/** ---------------- Session State Helpers ---------------- */
 const TERMINAL_STATES: SessionStatus[] = ["stopped", "expired"];
 const RESUMABLE_STATES: SessionStatus[] = ["paused", "disconnected"];
 const ACTIVE_STATES: SessionStatus[] = ["active", "charging"];
@@ -135,47 +140,47 @@ function summarizeEvent(incoming: IncomingEvent): string {
   return `${type} · ${kv}`;
 }
 
-/** ---------------- Time remaining helper ---------------- */
 function getTimeRemaining(expiresAt: string | null): string {
   if (!expiresAt || expiresAt === "—") return "—";
-  
+
   const now = Date.now();
   const expiry = new Date(expiresAt).getTime();
   const diff = expiry - now;
-  
+
   if (diff <= 0) return "EXPIRED";
-  
+
   const hours = Math.floor(diff / (1000 * 60 * 60));
   const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
   const seconds = Math.floor((diff % (1000 * 60)) / 1000);
-  
+
   if (hours > 0) return `${hours}h ${minutes}m`;
   if (minutes > 0) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
 }
 
-/** ---------------- App ---------------- */
 export default function App() {
   const [events, setEvents] = useState<IncomingEvent[]>([]);
-  const [sseStatus, setSseStatus] = useState<"connected" | "error" | "connecting">("connecting");
+  const [sseStatus, setSseStatus] = useState<
+    "connected" | "error" | "connecting"
+  >("connecting");
   const [filter, setFilter] = useState("");
   const [dbHealth, setDbHealth] = useState<DbHealth>("unknown");
   const [dbHealthDetail, setDbHealthDetail] = useState<string>("");
 
-  // Session controls
+  //session controls
   const [evId, setEvId] = useState("EV123");
   const [powerRequired, setPowerRequired] = useState<number>(18.5);
   const [sessionId, setSessionId] = useState<string>("");
   const [resumeToken, setResumeToken] = useState<string>("");
   const [apiLog, setApiLog] = useState<string>("");
-  
-  // Loading states for buttons
+
+  //loading states for buttons
   const [loading, setLoading] = useState<string | null>(null);
 
-  // Time remaining ticker
+  //time remaining ticker
   const [, setTick] = useState(0);
 
-  /** ---------------- SSE ---------------- */
+  //sse setup
   useEffect(() => {
     setSseStatus("connecting");
     const es = new EventSource(`${API_BASE}/events`);
@@ -198,13 +203,11 @@ export default function App() {
     return () => es.close();
   }, []);
 
-  /** ---------------- Time remaining ticker ---------------- */
   useEffect(() => {
     const interval = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(interval);
   }, []);
 
-  /** ---------------- DB health check ---------------- */
   const runDbHealth = async () => {
     setDbHealth("unknown");
     setDbHealthDetail("");
@@ -228,7 +231,6 @@ export default function App() {
     runDbHealth();
   }, []);
 
-  /** ---------------- API helper ---------------- */
   async function callSessionEndpoint<T = any>(
     path: string,
     body: Record<string, any>
@@ -245,7 +247,6 @@ export default function App() {
     return json as T;
   }
 
-  /** ---------------- Ledger-driven session state ---------------- */
   const currentFromLedger = useMemo(() => {
     if (!sessionId) return null;
 
@@ -256,7 +257,7 @@ export default function App() {
     return null;
   }, [events, sessionId]);
 
-  // Auto-fill sessionId from latest session events
+  //autofill sessionId from events
   useEffect(() => {
     if (sessionId) return;
 
@@ -269,36 +270,41 @@ export default function App() {
     }
   }, [events, sessionId]);
 
-  /** ---------------- Derived session state ---------------- */
   const sessionStatus: SessionStatus = useMemo(() => {
     if (!currentFromLedger) return "—";
-    
-    // First check if status field is set directly
+
+    //first check if status field is set directly
     if (currentFromLedger.status) return currentFromLedger.status;
-    
-    // Otherwise derive from eventType
+
+    //otherwise derive from eventType
     const eventType = currentFromLedger.eventType;
     if (eventType === "SessionStopped") return "stopped";
     if (eventType === "SessionExpired") return "expired";
     if (eventType === "SessionPaused") return "disconnected";
     if (eventType === "SessionStarted") return "active";
     if (eventType === "SessionResumed") return "active";
-    
+
     return "—";
   }, [currentFromLedger]);
 
   const sessionExpiresAt = currentFromLedger?.expiresAt || "—";
   const sessionEventKey = currentFromLedger?.eventKey || "—";
-  const timeRemaining = getTimeRemaining(sessionExpiresAt !== "—" ? sessionExpiresAt : null);
-  const expired = isSessionExpired(sessionExpiresAt !== "—" ? sessionExpiresAt : null);
+  const timeRemaining = getTimeRemaining(
+    sessionExpiresAt !== "—" ? sessionExpiresAt : null
+  );
+  const expired = isSessionExpired(
+    sessionExpiresAt !== "—" ? sessionExpiresAt : null
+  );
 
-  /** ---------------- Button state logic ---------------- */
-  const canStart = !sessionId || isTerminal(sessionStatus) || sessionStatus === "—";
+  //button states
+  const canStart =
+    !sessionId || isTerminal(sessionStatus) || sessionStatus === "—";
   const canPause = isActive(sessionStatus) && !expired;
   const canResume = isResumable(sessionStatus) && !expired && !!resumeToken;
-  const canStop = (isActive(sessionStatus) || isResumable(sessionStatus)) && !isTerminal(sessionStatus);
+  const canStop =
+    (isActive(sessionStatus) || isResumable(sessionStatus)) &&
+    !isTerminal(sessionStatus);
 
-  /** ---------------- Actions ---------------- */
   const doStart = async () => {
     setLoading("start");
     setApiLog("Calling /api/sessions/start ...");
@@ -340,7 +346,8 @@ export default function App() {
 
   const doResume = async () => {
     if (!sessionId) return alert("No sessionId. Start first (or paste one).");
-    if (!resumeToken) return alert("No resumeToken. Start first (or paste one).");
+    if (!resumeToken)
+      return alert("No resumeToken. Start first (or paste one).");
 
     setLoading("resume");
     setApiLog("Calling /api/sessions/resume ...");
@@ -370,7 +377,7 @@ export default function App() {
         { evId, sessionId }
       );
 
-      // Clear resume token since session is terminated
+      //clear session state
       setResumeToken("");
       setApiLog(prettyJson(data));
     } catch (e: any) {
@@ -386,7 +393,7 @@ export default function App() {
     setApiLog("");
   };
 
-  /** ---------------- Filtered events ---------------- */
+  //filtered events
   const filteredEvents = useMemo(() => {
     const q = filter.trim().toLowerCase();
     if (!q) return events;
@@ -410,15 +417,17 @@ export default function App() {
 
   const totalEvents = events.length;
 
-  /** ---------------- Status badge color ---------------- */
+  //status color helper
   const getStatusColor = (status: string) => {
-    if (isActive(status)) return "bg-emerald-500/20 text-emerald-300 border-emerald-500/40";
-    if (isResumable(status)) return "bg-amber-500/20 text-amber-300 border-amber-500/40";
-    if (isTerminal(status)) return "bg-red-500/20 text-red-300 border-red-500/40";
+    if (isActive(status))
+      return "bg-emerald-500/20 text-emerald-300 border-emerald-500/40";
+    if (isResumable(status))
+      return "bg-amber-500/20 text-amber-300 border-amber-500/40";
+    if (isTerminal(status))
+      return "bg-red-500/20 text-red-300 border-red-500/40";
     return "bg-slate-500/20 text-slate-300 border-slate-500/40";
   };
 
-  /** ---------------- UI ---------------- */
   return (
     <div className="min-h-screen bg-slate-950 text-slate-50">
       {/* Top bar */}
@@ -501,7 +510,9 @@ export default function App() {
         {/* Summary */}
         <section className="grid gap-4 md:grid-cols-3">
           <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-            <p className="text-xs font-medium text-slate-400">Total SSE events</p>
+            <p className="text-xs font-medium text-slate-400">
+              Total SSE events
+            </p>
             <p className="mt-2 text-2xl font-semibold">{totalEvents}</p>
             <p className="mt-1 text-xs text-slate-500">
               Events received since page load.
@@ -509,14 +520,20 @@ export default function App() {
           </div>
 
           <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-            <p className="text-xs font-medium text-slate-400">Current Session</p>
+            <p className="text-xs font-medium text-slate-400">
+              Current Session
+            </p>
             <p className="mt-2 text-xs text-slate-200">
               Session ID:{" "}
               <span className="font-mono break-all">{sessionId || "—"}</span>
             </p>
             <div className="mt-2 flex items-center gap-2">
               <span className="text-xs text-slate-400">Status:</span>
-              <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${getStatusColor(sessionStatus)}`}>
+              <span
+                className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${getStatusColor(
+                  sessionStatus
+                )}`}
+              >
                 {sessionStatus.toUpperCase()}
               </span>
               {expired && sessionStatus !== "expired" && (
@@ -527,7 +544,13 @@ export default function App() {
             </div>
             <p className="mt-2 text-xs text-slate-200">
               Time remaining:{" "}
-              <span className={`font-mono ${timeRemaining === "EXPIRED" ? "text-red-400" : "text-emerald-400"}`}>
+              <span
+                className={`font-mono ${
+                  timeRemaining === "EXPIRED"
+                    ? "text-red-400"
+                    : "text-emerald-400"
+                }`}
+              >
                 {timeRemaining}
               </span>
             </p>
@@ -687,27 +710,56 @@ export default function App() {
 
               {/* State explanation */}
               <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-3 space-y-2">
-                <p className="text-[0.7rem] text-slate-400 font-medium">Button States:</p>
+                <p className="text-[0.7rem] text-slate-400 font-medium">
+                  Button States:
+                </p>
                 <div className="text-[0.7rem] text-slate-500 space-y-1">
-                  <p>• <span className="text-emerald-400">Start</span>: No session or session is terminal</p>
-                  <p>• <span className="text-amber-400">Pause</span>: Session is active & not expired</p>
-                  <p>• <span className="text-sky-400">Resume</span>: Session is paused/disconnected & not expired & has token</p>
-                  <p>• <span className="text-red-400">Stop</span>: Session is active or paused (ends permanently)</p>
+                  <p>
+                    • <span className="text-emerald-400">Start</span>: No
+                    session or session is terminal
+                  </p>
+                  <p>
+                    • <span className="text-amber-400">Pause</span>: Session is
+                    active & not expired
+                  </p>
+                  <p>
+                    • <span className="text-sky-400">Resume</span>: Session is
+                    paused/disconnected & not expired & has token
+                  </p>
+                  <p>
+                    • <span className="text-red-400">Stop</span>: Session is
+                    active or paused (ends permanently)
+                  </p>
                 </div>
               </div>
 
               <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/40 p-3">
                 <p className="text-[0.7rem] text-slate-400">Ledger-derived</p>
                 <p className="mt-1 text-xs text-slate-200">
-                  Status: <span className={`font-mono px-1.5 py-0.5 rounded ${getStatusColor(sessionStatus)}`}>{sessionStatus}</span>
+                  Status:{" "}
+                  <span
+                    className={`font-mono px-1.5 py-0.5 rounded ${getStatusColor(
+                      sessionStatus
+                    )}`}
+                  >
+                    {sessionStatus}
+                  </span>
                 </p>
                 <p className="mt-2 text-xs text-slate-200">
                   Expires:{" "}
-                  <span className="font-mono break-all">{sessionExpiresAt}</span>
+                  <span className="font-mono break-all">
+                    {sessionExpiresAt}
+                  </span>
                 </p>
                 <p className="mt-1 text-xs text-slate-200">
                   Remaining:{" "}
-                  <span className={`font-mono ${timeRemaining === "EXPIRED" ? "text-red-400" : "text-emerald-400"}`}>
+                  <span
+                    className={`font-mono ${
+                      timeRemaining === "EXPIRED"
+                        ? "text-red-400"
+                        : "text-emerald-400"
+                    }`}
+                  >
                     {timeRemaining}
                   </span>
                 </p>
@@ -751,19 +803,30 @@ export default function App() {
 
           {filteredEvents.length === 0 ? (
             <div className="px-4 py-6 text-sm text-slate-400">
-              No events yet. Trigger Start/Pause/Resume/Stop to generate ledger events.
+              No events yet. Trigger Start/Pause/Resume/Stop to generate ledger
+              events.
             </div>
           ) : (
             <div className="max-h-[520px] overflow-y-auto">
               <table className="min-w-full text-left text-xs text-slate-300">
                 <thead className="sticky top-0 bg-slate-900">
                   <tr>
-                    <th className="px-4 py-2 font-medium text-slate-400">Timestamp</th>
-                    <th className="px-4 py-2 font-medium text-slate-400">Event</th>
-                    <th className="px-4 py-2 font-medium text-slate-400">Session</th>
+                    <th className="px-4 py-2 font-medium text-slate-400">
+                      Timestamp
+                    </th>
+                    <th className="px-4 py-2 font-medium text-slate-400">
+                      Event
+                    </th>
+                    <th className="px-4 py-2 font-medium text-slate-400">
+                      Session
+                    </th>
                     <th className="px-4 py-2 font-medium text-slate-400">EV</th>
-                    <th className="px-4 py-2 font-medium text-slate-400">Tx ID</th>
-                    <th className="px-4 py-2 font-medium text-slate-400">Summary</th>
+                    <th className="px-4 py-2 font-medium text-slate-400">
+                      Tx ID
+                    </th>
+                    <th className="px-4 py-2 font-medium text-slate-400">
+                      Summary
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -774,18 +837,24 @@ export default function App() {
                     const evid = pickEvId(evt);
 
                     const txFull = evt.payload?.txId || evt.txId || "";
-                    const txShort = txFull.length > 16 ? `${txFull.slice(0, 16)}…` : txFull;
+                    const txShort =
+                      txFull.length > 16 ? `${txFull.slice(0, 16)}…` : txFull;
 
                     const summary = summarizeEvent(evt);
 
                     // Event type color
-                    const eventColor = 
-                      type === "SessionStarted" ? "text-emerald-400" :
-                      type === "SessionPaused" ? "text-amber-400" :
-                      type === "SessionResumed" ? "text-sky-400" :
-                      type === "SessionStopped" ? "text-red-400" :
-                      type === "SessionExpired" ? "text-red-400" :
-                      "text-slate-100";
+                    const eventColor =
+                      type === "SessionStarted"
+                        ? "text-emerald-400"
+                        : type === "SessionPaused"
+                        ? "text-amber-400"
+                        : type === "SessionResumed"
+                        ? "text-sky-400"
+                        : type === "SessionStopped"
+                        ? "text-red-400"
+                        : type === "SessionExpired"
+                        ? "text-red-400"
+                        : "text-slate-100";
 
                     return (
                       <tr
@@ -793,25 +862,41 @@ export default function App() {
                         className="border-t border-slate-800/80 hover:bg-slate-800/40"
                       >
                         <td className="px-4 py-2 align-top">
-                          <span className="font-mono text-[0.7rem] text-slate-400">{ts}</span>
+                          <span className="font-mono text-[0.7rem] text-slate-400">
+                            {ts}
+                          </span>
                         </td>
                         <td className="px-4 py-2 align-top">
-                          <span className={`text-[0.75rem] font-medium ${eventColor}`}>{type}</span>
+                          <span
+                            className={`text-[0.75rem] font-medium ${eventColor}`}
+                          >
+                            {type}
+                          </span>
                         </td>
                         <td className="px-4 py-2 align-top">
-                          <span className="font-mono text-[0.7rem] break-all">{sid}</span>
+                          <span className="font-mono text-[0.7rem] break-all">
+                            {sid}
+                          </span>
                         </td>
                         <td className="px-4 py-2 align-top">
-                          <span className="font-mono text-[0.7rem]">{evid}</span>
+                          <span className="font-mono text-[0.7rem]">
+                            {evid}
+                          </span>
                         </td>
                         <td className="px-4 py-2 align-top">
-                          <span className="font-mono text-[0.7rem]">{txShort || "(none)"}</span>
+                          <span className="font-mono text-[0.7rem]">
+                            {txShort || "(none)"}
+                          </span>
                         </td>
                         <td className="px-4 py-2 align-top">
-                          <span className="text-[0.75rem] text-slate-100 break-words">{summary}</span>
+                          <span className="text-[0.75rem] text-slate-100 break-words">
+                            {summary}
+                          </span>
 
                           <details className="mt-1">
-                            <summary className="cursor-pointer text-[0.7rem] text-slate-500">raw</summary>
+                            <summary className="cursor-pointer text-[0.7rem] text-slate-500">
+                              raw
+                            </summary>
                             <pre className="mt-2 whitespace-pre-wrap break-words rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-[0.7rem] text-slate-200">
                               {evt.payload?.payload || "(none)"}
                             </pre>

@@ -7,6 +7,7 @@ import { Gateway, Wallets } from "fabric-network";
 
 import { healthRouter } from "./routes/health.routes";
 import { createSessionsRouter } from "./routes/session.routes";
+import { initLedgerQueue, getQueueStatus, retryDeadEvents, queueStats } from "./lib/ledgerQueue";
 
 const app = express();
 app.use(cors());
@@ -14,7 +15,7 @@ app.use(express.json());
 
 let contract: any = null;
 
-/** ---------------- SSE ---------------- */
+//sse clients
 const sseClients = new Set<Response>();
 
 function broadcastSSE(data: any) {
@@ -23,23 +24,46 @@ function broadcastSSE(data: any) {
     try {
       client.write(msg);
     } catch {
-      // ignore; close handler will clean up
+      //handler will clean up
     }
   }
 }
 
-/** contract ref wrapper so routes can fetch latest contract after init */
+//red wrapper
 const contractRef = {
   get: () => contract,
 };
 
-/** ---------------- Routes ---------------- */
+//routes 
 app.use("/health", healthRouter);
-
-// ✅ IMPORTANT: pass broadcaster so session routes push to UI live
 app.use("/api/sessions", createSessionsRouter(contractRef, broadcastSSE));
 
-/** ---------------- Fabric Identity ---------------- */
+//queue status endpoint
+app.get("/api/queue/status", async (req: Request, res: Response) => {
+  try {
+    const dbStatus = await getQueueStatus();
+    res.json({
+      ok: true,
+      queue: dbStatus,
+      stats: queueStats,
+    });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+//retry dead events endpoint
+app.post("/api/queue/retry", async (req: Request, res: Response) => {
+  try {
+    const { sessionId } = req.body;
+    const count = await retryDeadEvents(sessionId);
+    res.json({ ok: true, retriedCount: count });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+//fabric identity setup
 async function loadIdentity() {
   const walletPath = path.join(__dirname, "wallet");
   const wallet = await Wallets.newFileSystemWallet(walletPath);
@@ -90,7 +114,7 @@ async function loadIdentity() {
   return { wallet, identityLabel };
 }
 
-/** ---------------- Fabric Init ---------------- */
+//init fabric
 async function initFabric() {
   const ccpPath = path.resolve(
     process.env.HOME || "",
@@ -116,66 +140,13 @@ async function initFabric() {
   contract = network.getContract("ev-contract");
 
   console.log("Fabric connection ready (discovery ON).");
+
+  //init ledger queue
+  initLedgerQueue(contractRef, broadcastSSE);
+  console.log("Ledger queue initialized - background processor running.");
 }
 
-/** ---------------- /api/log (kept) ---------------- */
-app.post("/api/log", async (req: Request, res: Response) => {
-  try {
-    if (!contract) {
-      return res
-        .status(503)
-        .json({ error: "Fabric not initialized (still ok for DB endpoints)" });
-    }
-
-    const { sessionId, source, payload, evId } = req.body;
-
-    if (!sessionId || !source || payload === undefined) {
-      return res
-        .status(400)
-        .json({ error: "sessionId, source, and payload are required" });
-    }
-
-    // fallbacks
-    const _evId = evId || "EV_UNKNOWN";
-    const eventType = "log";
-
-    const tx = contract.createTransaction("AppendSessionEvent");
-
-    // try to get txId early for UI display
-    let txId = "UNKNOWN_TX";
-    try {
-      const raw = tx.getTransactionId?.();
-      txId =
-        raw?.getTransactionID?.() || raw?.transactionId || raw || "UNKNOWN_TX";
-    } catch {}
-
-    // IMPORTANT: payload must be string
-    const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
-
-    // NEW SIGNATURE: (sessionId, evId, eventType, source, payload)
-    await tx.submit(sessionId, _evId, eventType, source, payloadStr);
-
-    const record = {
-      sessionId,
-      evId: _evId,
-      eventType,
-      source,
-      payload: payloadStr,
-      timestamp: new Date().toISOString(),
-      txId,
-    };
-
-    broadcastSSE({ eventName: "AppendSessionEvent", txId, payload: record });
-
-    return res.json({ ok: true, txId });
-  } catch (err: any) {
-    console.error("Error in /api/log:", err);
-    return res.status(500).json({ error: err.message });
-  }
-});
-
-
-/** ---------------- SSE endpoint (reliable: flush + heartbeat) ---------------- */
+//sse endpoint
 app.get("/events", (req: Request, res: Response) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Content-Type", "text/event-stream");
@@ -186,7 +157,6 @@ app.get("/events", (req: Request, res: Response) => {
   // @ts-ignore
   res.flushHeaders?.();
 
-  // immediate hello event so UI can confirm connection
   res.write(
     `data: ${JSON.stringify({
       eventName: "SSE_CONNECTED",
@@ -215,14 +185,17 @@ app.get("/events", (req: Request, res: Response) => {
   });
 });
 
-/** ---------------- Start server, then init Fabric ---------------- */
+//start server
 app.listen(4000, () => {
   console.log("Ledger server listening on http://localhost:4000");
 });
 
 initFabric().catch((err) => {
   console.error(
-    "Fabric init failed (DB routes still available):",
+    "Fabric init failed (DB routes still available, queue will retry when Fabric is up):",
     err.message || err
   );
+  
+  //still start ledger queue without Fabric
+  initLedgerQueue(contractRef, broadcastSSE);
 });
